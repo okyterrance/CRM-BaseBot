@@ -246,6 +246,65 @@ def test_看板已经有值时不重导(fake_bitable, tmp_path):
     assert second.deleted == 0
 
 
+# ---------- 客户晚登记：以前的交易补挂上 ----------
+
+
+def test_客户后来才登记_他以前的交易也补挂上(fake_bitable, tmp_path):
+    """超哥 9/26 才登记小李，小李 9/17 的交易在看板里右边一直是空的 —— 下一次导入补上。"""
+    old = _seed_board(fake_bitable, date(2026, 9, 17), uid="333")
+    client = fake_bitable.table(TBL_CLIENT).add_existing({schema.CLIENT_UID: "333"})
+    xlsx = _make_xlsx(tmp_path, [_row(when="2026-09-17", uid="333")])
+
+    result = run_daily(settings=_settings(), bitable=fake_bitable, file=xlsx)
+
+    assert result.plan.has_work is False  # 没有新交易日，照样补
+    assert result.relinked == 1
+    assert fake_bitable.table(TBL_BOARD).records[old][schema.BOARD_CLIENT_LINK] == [client]
+
+
+def test_补挂只补空的_挂上的和没登记的都不动(fake_bitable, tmp_path):
+    first = fake_bitable.table(TBL_CLIENT).add_existing({schema.CLIENT_UID: "333"})
+    linked = _seed_board(fake_bitable, date(2026, 9, 17), uid="333")
+    fake_bitable.table(TBL_BOARD).records[linked][schema.BOARD_CLIENT_LINK] = ["recOther"]
+    stranger = _seed_board(fake_bitable, date(2026, 9, 17), uid="444")
+    xlsx = _make_xlsx(tmp_path, [_row(when="2026-09-17", uid="333")])
+
+    result = run_daily(settings=_settings(), bitable=fake_bitable, file=xlsx)
+
+    board = fake_bitable.table(TBL_BOARD).records
+    assert result.relinked == 0
+    assert board[linked][schema.BOARD_CLIENT_LINK] == ["recOther"]
+    assert schema.BOARD_CLIENT_LINK not in board[stranger]
+    assert first  # 客户表里有人，但他的行已经挂着别的，不改
+
+
+def test_dry_run也不补挂(fake_bitable, tmp_path):
+    _seed_board(fake_bitable, date(2026, 9, 17), uid="333")
+    fake_bitable.table(TBL_CLIENT).add_existing({schema.CLIENT_UID: "333"})
+    xlsx = _make_xlsx(tmp_path, [_row(when="2026-09-18", uid="333")])
+
+    result = run_daily(settings=_settings(), bitable=fake_bitable, file=xlsx, dry_run=True)
+
+    assert result.relinked == 0
+    assert fake_bitable.updates == []
+
+
+def test_补挂失败不影响当天的导入(fake_bitable, tmp_path, monkeypatch, caplog):
+    from crm_basebot.pipeline import board
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("网络断了")
+
+    monkeypatch.setattr(board, "relink_missing", boom)
+    xlsx = _make_xlsx(tmp_path, [_row(when="2026-09-17", uid="222")])
+
+    result = run_daily(settings=_settings(), bitable=fake_bitable, file=xlsx)
+
+    assert result.written == 1
+    assert result.relinked == 0
+    assert "补挂客户关联失败" in caplog.text
+
+
 def test_模块的公开面就是那几个名字():
     """pipeline 是对外契约：脚本只能从这些名字进，别的地方不该被 import。"""
     import crm_basebot.pipeline as pipeline

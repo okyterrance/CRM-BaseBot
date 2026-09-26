@@ -106,6 +106,14 @@ AI_STATUS_UPGRADED = "升级为AI"
 AI_STATUS_NOT = "非AI"
 AI_STATUS_OPTIONS = (AI_STATUS_ALREADY, AI_STATUS_UPGRADED, AI_STATUS_NOT)
 
+# 公式：把上面两列换算成一个「门槛数」，交易日（写成 20260910 这种数）大于它才算佣金。
+# 0 = 什么时候的交易都算；99999999 = 都不算；20260910 = 9 月 10 日升级，11 日起算。
+# 规则本身在 domain/ai_status.py（``AiEligibility.gate_number`` 是同一个数的 Python 版）。
+CLIENT_AI_GATE = "AI佣金起算"
+AI_GATE_ALWAYS = 0
+AI_GATE_NEVER = 99999999
+AI_RULE_START_NUMBER = 20260901  # 2026-09-01 以前的交易不看 AI，照旧算
+
 CLIENT_FIELDS: dict[str, int] = {
     # 必须是文本。18-19 位 UID 存成数字会在服务端就被 float64 抹平精度。
     CLIENT_UID: FIELD_TYPE_TEXT,
@@ -211,9 +219,13 @@ BOARD_CLIENT_LINK = "客户"  # 单向关联 -> Referred Client
 BOARD_REFERRAL_NO = "渠道编号"  # 公式：渠道的 Referral Code
 BOARD_REFERRAL_NAME = "渠道名称"  # 公式：渠道的 Name
 BOARD_CLIENT_RATE = "分佣比例"  # 公式：渠道的 Commission Rate，百分数
-# 以前还有一列「本笔佣金」（收入 × 比例）。2026-09-25 删了：AI 规则上线后（升级为 AI 之前
-# 的月份不算），这一列不知道那条规则，Base 里看到的会和机器人、月结对不上。结算从来不读它。
 BOARD_MONTH = "月份"  # 公式：交易日期所属月份，形如 2026-07
+BOARD_AI_GATE = "AI佣金起算"  # 公式：客户的 AI 门槛数，照抄客户表同名列
+# 公式：这一笔该分出去的钱，按 AI 规则（升级第二天起才算，之前的显示 0）。
+# 2026-09-25 一度要删（那时它不知道 AI 规则，会和机器人对不上），9-26 改成带 AI 规则留下：
+# 超哥每天就看这一列。**结算从来不读它**，钱一直是 Python 算的（domain/commission.py），
+# 这一列只是让 Base 里看到的和机器人一致。
+BOARD_ROW_COMMISSION = "本笔佣金"
 
 # 公式返回值的类型码。formula_type=2 的多维表格建公式字段时必须带上它，不带接口报错。
 # 只实测过这两个值。
@@ -227,7 +239,19 @@ DAILY_BOARD_DERIVED_FIELDS: dict[str, int] = {
     BOARD_REFERRAL_NAME: FIELD_TYPE_FORMULA,
     BOARD_CLIENT_RATE: FIELD_TYPE_FORMULA,
     BOARD_MONTH: FIELD_TYPE_FORMULA,
+    BOARD_AI_GATE: FIELD_TYPE_FORMULA,
+    BOARD_ROW_COMMISSION: FIELD_TYPE_FORMULA,
 }
+
+
+def _day_number(field_name: str) -> str:
+    """公式片段：日期列 -> 20260910 这种数。
+
+    YEAR/MONTH/DAY 按平台时区取（实测 UTC+8，和业务时区同一偏移，见「月份」那条）。
+    比日期先换成数，是因为跨表拿过来的日期能不能直接比大小没有实测过，数一定能比。
+    """
+    return f"(YEAR([{field_name}]) * 10000 + MONTH([{field_name}]) * 100 + DAY([{field_name}]))"
+
 
 # 公式：列名 -> (表达式, 返回类型)。
 #
@@ -257,6 +281,40 @@ DAILY_BOARD_DERIVED_FORMULAS: dict[str, tuple[str, int]] = {
     BOARD_MONTH: (
         f'TEXT([{BOARD_ORDER_DATE}], "yyyy-MM")',
         FORMULA_DATA_TYPE_TEXT,
+    ),
+    # 和「分佣比例」同一个套路：先用一列把客户表的值拿过来，再在本表里用。这是实测过能用
+    # 的形状（2026-09-18），比在「本笔佣金」里直接跨表比大小稳。
+    BOARD_AI_GATE: (
+        f"[{BOARD_CLIENT_LINK}].[{CLIENT_AI_GATE}]",
+        FORMULA_DATA_TYPE_NUMBER,
+    ),
+    # 没挂上渠道 → 空（不是 0：0 等于宣称「这笔没有佣金」，实际是「不知道」）。
+    # 9 月以前的交易、或者交易日晚于门槛 → 收入 × 比例；否则 0（还不是 AI）。
+    # 日期换成 20260910 这种数再比，理由同「AI佣金起算」。
+    BOARD_ROW_COMMISSION: (
+        f'IF(ISBLANK([{BOARD_CLIENT_RATE}]), "", '
+        f"IF(OR({_day_number(BOARD_ORDER_DATE)} < {AI_RULE_START_NUMBER}, "
+        f"{_day_number(BOARD_ORDER_DATE)} > [{BOARD_AI_GATE}]), "
+        f"[{BOARD_TOTAL_REVENUE}] * [{BOARD_CLIENT_RATE}] / 100, 0))",
+        FORMULA_DATA_TYPE_NUMBER,
+    ),
+}
+
+# 客户表上的公式列（sync_base 建在 CLIENT_FIELDS 后面）。
+CLIENT_DERIVED_FIELDS: dict[str, int] = {
+    CLIENT_AI_GATE: FIELD_TYPE_FORMULA,
+}
+
+CLIENT_DERIVED_FORMULAS: dict[str, tuple[str, int]] = {
+    # 开户即AI → 0；有升级日期 → 那天的数；没日期时「非AI」「升级为AI」→ 99999999；
+    # 其余（2026-09-25 前登记、两列空着的老客户）→ 0。顺序和 ai_status.gate_number 一致。
+    CLIENT_AI_GATE: (
+        f'IF([{CLIENT_AI_STATUS}] = "{AI_STATUS_ALREADY}", {AI_GATE_ALWAYS}, '
+        f"IF(ISBLANK([{CLIENT_AI_DATE}]), "
+        f'IF(OR([{CLIENT_AI_STATUS}] = "{AI_STATUS_NOT}", '
+        f'[{CLIENT_AI_STATUS}] = "{AI_STATUS_UPGRADED}"), {AI_GATE_NEVER}, {AI_GATE_ALWAYS}), '
+        f"{_day_number(CLIENT_AI_DATE)}))",
+        FORMULA_DATA_TYPE_NUMBER,
     ),
 }
 

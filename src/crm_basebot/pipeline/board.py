@@ -19,7 +19,7 @@ from typing import Any
 from ..domain import schema
 from ..domain.dates import date_to_ms, ms_to_date
 from ..lark.bitable import BitableClient
-from ..lark.values import to_uid
+from ..lark.values import PrecisionLossError, link_ids, to_uid
 from .export import DATE_FIELDS, BoardRow
 
 # 看板表里那几个「派生列」由 Base 公式维护，写入时绝不能出现在 payload 里
@@ -88,6 +88,34 @@ def client_links(bitable: BitableClient, table_id: str) -> dict[str, str]:
             # 真出现重复行是登记侧的问题，不该在这里选一个「更对」的出来。
             links.setdefault(uid, record.record_id)
     return links
+
+
+def relink_missing(bitable: BitableClient, table_id: str, links: dict[str, str]) -> int:
+    """看板上「客户」关联空着、但那个用户ID 现在已经登记了的行，补挂上。返回补了几行。
+
+    关联只在交易写进看板的那一刻挂（见 ``to_payload``）。客户晚登记的话，他以前的交易
+    就一直空着 —— 右边的渠道、比例、本笔佣金全是空的，而且不会自己变。每天导入时顺手
+    跑一次这个，客户登记后第二天，他以前的行也都补上了。
+
+    只补空的，**已经挂上的一律不动**：改挂等于把一笔交易改算给别的客户，要人来决定。
+    """
+    updates: dict[str, dict[str, Any]] = {}
+    for record in bitable.iter_records(
+        table_id, field_names=[schema.BOARD_CLIENT_UID, schema.BOARD_CLIENT_LINK]
+    ):
+        # 空关联读回来是 {"link_record_ids": None}，判真假会当成挂上了，要拆开看。
+        if link_ids(record.fields.get(schema.BOARD_CLIENT_LINK)):
+            continue
+        try:
+            uid = to_uid(record.fields.get(schema.BOARD_CLIENT_UID))
+        except PrecisionLossError:
+            continue
+        client_record_id = links.get(uid) if uid else None
+        if client_record_id:
+            updates[record.record_id] = {schema.BOARD_CLIENT_LINK: [client_record_id]}
+    if not updates:
+        return 0
+    return bitable.batch_update_records(table_id, updates)
 
 
 def apply_import(

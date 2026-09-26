@@ -1,13 +1,15 @@
-"""把 Base 的结构对齐到目标结构。只增，不改，不删。
+"""把 Base 的结构对齐到目标结构。只增，不删；不改（我们维护的公式列除外）。
 
 Base 里已经有同事在用的表，所以安全边界很明确：
 
   - 缺的表 → 建
   - 缺的字段 → 加
   - 已存在的字段类型不对 → **只报告，不动手**（改类型可能毁数据，人来决定）
+  - 我们维护的公式列，公式和这里的不一样 → 换成这里的（值是算出来的，换了不丢数据）
   - 多出来的表和字段 → 完全不碰
 
-看板表除了 xlsx 里那 18 列，还会建「渠道反查列」：一个单向关联 + 四个公式，定义在
+看板表除了 xlsx 里那 18 列，还会建「渠道反查列」：一个单向关联 + 几个公式
+（渠道、比例、月份、AI 门槛、本笔佣金），定义在
 ``schema.DAILY_BOARD_DERIVED_FIELDS`` / ``DAILY_BOARD_DERIVED_FORMULAS``。
 **平台不校验公式表达式** —— 写错的公式照样建得出来，只是永远返回空值，所以调用方
 （``scripts/sync_base.py``）建完要拿真实记录做一次公式自检。
@@ -38,6 +40,7 @@ from lark_oapi.api.bitable.v1 import (
     CreateAppTableRequest,
     CreateAppTableRequestBody,
     ReqTable,
+    UpdateAppTableFieldRequest,
 )
 
 from .domain import schema
@@ -54,7 +57,8 @@ from .startup import set_env_value
 # 我们负责维护的表。
 TARGET_TABLES: dict[str, dict[str, int]] = {
     schema.TABLE_REFERRAL_NAME: schema.REFERRAL_FIELDS,
-    schema.TABLE_CLIENT_NAME: schema.CLIENT_FIELDS,
+    # 客户表 = 登记要填的列 + AI 门槛公式列（放最后，公式要引用前面的 AI 两列）。
+    schema.TABLE_CLIENT_NAME: {**schema.CLIENT_FIELDS, **schema.CLIENT_DERIVED_FIELDS},
     # 看板 = xlsx 里那 18 列（导入的合同）+ 渠道反查列（关联和公式，导入不碰）。
     schema.TABLE_DAILY_BOARD_NAME: {
         **schema.DAILY_BOARD_FIELDS,
@@ -118,7 +122,7 @@ class StructureResult:
 
     @property
     def added_fields(self) -> int:
-        return len(self.plan) - self.built_tables
+        return sum(1 for item in self.plan if "加字段" in item)
 
     @property
     def changed(self) -> bool:
@@ -243,11 +247,52 @@ def create_field(
         raise StructureError(f"加字段 {name} 失败: {response.code} {response.msg}")
 
 
+# (表名, 字段名) -> (表达式, 返回类型)。我们维护的公式列就这些。
+FORMULAS: dict[tuple[str, str], tuple[str, int]] = {
+    **{
+        (schema.TABLE_DAILY_BOARD_NAME, name): formula
+        for name, formula in schema.DAILY_BOARD_DERIVED_FORMULAS.items()
+    },
+    **{
+        (schema.TABLE_CLIENT_NAME, name): formula
+        for name, formula in schema.CLIENT_DERIVED_FORMULAS.items()
+    },
+}
+
+
 def _formula_for(table_name: str, field_name: str) -> tuple[str, int] | None:
-    """公式字段的 (表达式, 返回类型)。只有看板的反查列是公式，其余返回 None。"""
-    if table_name != schema.TABLE_DAILY_BOARD_NAME:
-        return None
-    return schema.DAILY_BOARD_DERIVED_FORMULAS.get(field_name)
+    """公式字段的 (表达式, 返回类型)。不是我们维护的公式列返回 None。"""
+    return FORMULAS.get((table_name, field_name))
+
+
+def _same_expression(current: str, wanted: str) -> bool:
+    """空格不算差别：平台读回来的表达式可能改过空格。"""
+    return "".join(current.split()) == "".join(wanted.split())
+
+
+def update_formula(
+    client: lark.Client,
+    app_token: str,
+    table_id: str,
+    field_id: str,
+    name: str,
+    formula: tuple[str, int],
+) -> None:
+    """把一列已有的公式换成新的。公式列的值是算出来的，换公式不丢任何数据。"""
+    request = (
+        UpdateAppTableFieldRequest.builder()
+        .app_token(app_token)
+        .table_id(table_id)
+        .field_id(field_id)
+        .request_body(build_field(name, FIELD_TYPE_FORMULA, formula=formula))
+        .build()
+    )
+    response = client.bitable.v1.app_table_field.update(request)
+    if not response.success():
+        raise StructureError(
+            f"改公式 {name} 失败: {response.code} {response.msg}。"
+            f"可以在 Base 里把「{name}」这一列删掉，再跑一次 sync_base.py --apply 让它重建。"
+        )
 
 
 def ensure_structure(
@@ -305,6 +350,23 @@ def ensure_structure(
                         link_table_id=link_target_id(table_name, field_name),
                         formula=_formula_for(table_name, field_name),
                     )
+            elif found.type == type_code == FIELD_TYPE_FORMULA and (
+                wanted := _formula_for(table_name, field_name)
+            ):
+                # 公式列的值是算出来的，换公式不会毁数据 —— 所以这一种「改」是允许的。
+                # 规则变了（例如 2026-09-26 本笔佣金加上 AI 规则）要靠这里把老表跟上。
+                expression_now = str((found.props or {}).get("formula_expression") or "")
+                if not _same_expression(expression_now, wanted[0]):
+                    result.plan.append(f"「{table_name}」改公式 {field_name}")
+                    if apply:
+                        update_formula(
+                            client,
+                            settings.base_app_token,
+                            table_id,
+                            found.field_id,
+                            field_name,
+                            wanted,
+                        )
             elif found.type != type_code:
                 result.warnings.append(
                     f"「{table_name}」的 {field_name} 现在是 {type_name(found.type)}，"

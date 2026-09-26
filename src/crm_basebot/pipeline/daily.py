@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -82,6 +82,8 @@ class DailyResult:
     plan: DailyPlan
     deleted: int = 0
     written: int = 0
+    # 以前的交易里，客户后来才登记、这次补挂上关联的行数（见 board.relink_missing）。
+    relinked: int = 0
     linked_rows: int = 0
     unregistered_users: int = 0
 
@@ -265,6 +267,18 @@ def run_daily(
         max_days=max_days,
         allow_many_days=allow_many_days,
     )
-    if dry_run or not plan.has_work:
+    if dry_run:
         return DailyResult(plan=plan)
-    return apply_plan(plan=plan, bitable=bitable, settings=settings)
+    result = apply_plan(plan=plan, bitable=bitable, settings=settings)
+    # 没有新增交易日也要跑：周末没新数据，但周五登记的客户照样该补上。
+    # 补挂是顺手的事：它失败不能让「今天的交易导进去了」这件主事报失败，记日志就好。
+    try:
+        relinked = board_module.relink_missing(
+            bitable,
+            settings.table_daily_board,
+            board_module.client_links(bitable, settings.table_client),
+        )
+    except Exception:  # noqa: BLE001 - 见上
+        logger.exception("补挂客户关联失败（今天的导入不受影响），明天会再试")
+        return result
+    return replace(result, relinked=relinked)

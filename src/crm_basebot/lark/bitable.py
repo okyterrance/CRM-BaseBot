@@ -30,6 +30,8 @@ from lark_oapi.api.bitable.v1 import (
     BatchCreateAppTableRecordRequestBody,
     BatchDeleteAppTableRecordRequest,
     BatchDeleteAppTableRecordRequestBody,
+    BatchUpdateAppTableRecordRequest,
+    BatchUpdateAppTableRecordRequestBody,
     Condition,
     CreateAppTableRecordRequest,
     DeleteAppTableRecordRequest,
@@ -527,6 +529,51 @@ class BitableClient:
                 )
             deleted += len(chunk)
         return deleted
+
+    def batch_update_records(
+        self,
+        table_id: str,
+        updates: dict[str, dict[str, Any]],
+        *,
+        batch_size: int = MAX_BATCH_SIZE,
+    ) -> int:
+        """批量改已有记录的部分字段，``updates`` 是 record_id -> 要改的字段。返回改了几条。
+
+        为什么要批量、怎么切，同 ``batch_create_records``。只改点名的字段，其余不动。
+        """
+        _check_batch_size(batch_size)
+        items = list(updates.items())
+        updated = 0
+        for start in range(0, len(items), batch_size):
+            chunk = items[start : start + batch_size]
+            body = (
+                BatchUpdateAppTableRecordRequestBody.builder()
+                .records(
+                    [
+                        AppTableRecord.builder().record_id(record_id).fields(fields).build()
+                        for record_id, fields in chunk
+                    ]
+                )
+                .build()
+            )
+            request = (
+                BatchUpdateAppTableRecordRequest.builder()
+                .app_token(self._app_token)
+                .table_id(table_id)
+                .request_body(body)
+                .build()
+            )
+            with _WRITE_LOCK:
+                response = self._client.bitable.v1.app_table_record.batch_update(request)
+                data = _check(response, f"批量更新记录 table_id={table_id}")
+            done = data.records or []
+            if len(done) != len(chunk):
+                raise BitableError(
+                    f"批量更新 table_id={table_id} 这一批发了 {len(chunk)} 条，"
+                    f"平台只回了 {len(done)} 条；在这一批之前已更新 {updated} 条"
+                )
+            updated += len(chunk)
+        return updated
 
     # ---------- schema 快照 ----------
 

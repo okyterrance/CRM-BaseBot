@@ -32,7 +32,7 @@ from ..lark.bitable import BitableClient, Record
 from ..lark.values import extract_text, to_number, to_uid
 from . import schema
 from .ai_status import AiEligibility, eligibility_of
-from .commission import CENTS, Referral, _link_ids, period_of
+from .commission import CENTS, Referral, _link_ids, period_of, trade_counts
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ def accumulate(
     只收 ``periods`` 里的月份、``client_map`` 里的客户（UID -> 所属渠道）；其余的行
     跳过。佣金查询和渠道详情卡共用这一个函数，见模块开头第 4 条。
 
-    ``eligibility`` 是客户UID -> AI 资格：那个月还不是 AI 的客户，交易不算（见
+    ``eligibility`` 是客户UID -> AI 资格：交易那天还不是 AI 的，这一笔不算（见
     domain/ai_status.py，和月结同一条规则）。不在里面的客户照旧算。
     """
     eligibility = eligibility or {}
@@ -175,10 +175,11 @@ def accumulate(
         referral = client_map.get(uid)
         if referral is None:
             continue
-        period = period_of(record.fields.get(schema.BOARD_ORDER_DATE), tz=tz)
+        order_time = record.fields.get(schema.BOARD_ORDER_DATE)
+        period = period_of(order_time, tz=tz)
         if period not in wanted:
             continue
-        if not eligibility.get(uid, AiEligibility()).counts(period):
+        if not trade_counts(eligibility.get(uid), order_time, tz=tz):
             continue
         revenue = to_number(record.fields.get(schema.BOARD_TOTAL_REVENUE))
         if revenue is None:

@@ -150,7 +150,7 @@ AI_CHOICES: list[tuple[str, str]] = [
     (f"{schema.AI_STATUS_NOT}（暂不算交易佣金）", schema.AI_STATUS_NOT),
 ]
 
-AI_RULE_NOTE = "交易佣金从客户成为 AI 的那个月起算（整月都算）；非 AI 不算。ECAS 返佣不看 AI。"
+AI_RULE_NOTE = "交易佣金从客户升级 AI 的第二天起算；非 AI 不算。ECAS 返佣不看 AI。"
 
 
 def _ai_fields(status_name: str, date_name: str) -> list[dict[str, Any]]:

@@ -21,7 +21,7 @@ from crm_basebot.domain import ecas, schema
 from crm_basebot.domain.dates import DEFAULT_BUSINESS_TIMEZONE, date_to_ms
 from crm_basebot.lark.bitable import FieldInfo, TableInfo
 
-from .conftest import TBL_AUDIT, TBL_CLIENT, TBL_ECAS, TBL_REFERRAL, TBL_SALES
+from .conftest import TBL_AUDIT, TBL_BOARD, TBL_CLIENT, TBL_ECAS, TBL_REFERRAL, TBL_SALES
 
 SGT = DEFAULT_BUSINESS_TIMEZONE
 PRANCE = "ou_prance00000000000000000000000"
@@ -38,6 +38,7 @@ def _load(name: str):
 
 register = _load("register_ai_clients")
 appender = _load("append_ecas")
+relinker = _load("relink_board")
 
 
 def _settings():
@@ -48,6 +49,7 @@ def _settings():
         table_sales=TBL_SALES,
         table_audit=TBL_AUDIT,
         table_ecas=TBL_ECAS,
+        table_daily_board=TBL_BOARD,
         business_timezone="Asia/Singapore",
     )
 
@@ -385,3 +387,23 @@ def test_整表导入遇到追加进来的行就拒绝(tmp_path, monkeypatch, ap
     assert importer.main(["--file", str(path), "--refresh", "--apply"]) == 1
     assert "--wipe-appended" in capsys.readouterr().err
     assert len(_ecas_rows(appending)) == 1
+
+
+# ---------- relink_board：客户晚登记，今天就补上他以前的交易 ----------
+
+
+def test_补挂脚本预演不写_加apply才补(monkeypatch, fake_bitable, capsys):
+    _wire(monkeypatch, relinker, fake_bitable)
+    client = fake_bitable.tables[TBL_CLIENT].add_existing({schema.CLIENT_UID: "577809207768677761"})
+    row = fake_bitable.tables[TBL_BOARD].add_existing(
+        {schema.BOARD_CLIENT_UID: "577809207768677761"}
+    )
+    fake_bitable.tables[TBL_BOARD].add_existing({schema.BOARD_CLIENT_UID: "577809207768677769"})
+
+    assert relinker.main([]) == 0
+    assert "会补 1 行（1 个客户）" in capsys.readouterr().out
+    assert fake_bitable.updates == []
+
+    assert relinker.main(["--apply"]) == 0
+    assert "补好了 1 行" in capsys.readouterr().out
+    assert fake_bitable.tables[TBL_BOARD].records[row][schema.BOARD_CLIENT_LINK] == [client]

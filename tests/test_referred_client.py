@@ -266,7 +266,7 @@ def test_补上升级日期(fake_bitable, services):
 
 
 def test_改回开户即AI时清掉旧日期(fake_bitable, services):
-    """判定时日期优先。旧日期留着的话，状态说「开户即AI」，算的却还是升级那个月起。"""
+    """旧日期留着的话，状态说「开户即AI」，Base 里看到的却是一个升级日期，两头说法对不上。"""
     referrals, clients = services
     no = _referral(referrals, alice)
     record_id = clients.create(

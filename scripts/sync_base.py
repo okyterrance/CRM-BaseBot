@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-"""把 Base 的结构对齐到目标结构。只增，不改，不删。
+"""把 Base 的结构对齐到目标结构。只增，不删；不改（我们维护的公式列除外）。
 
     uv run python scripts/sync_base.py            # 预演，打印将要做什么
     uv run python scripts/sync_base.py --apply    # 真的执行
 
 安全边界：缺的表建、缺的字段加、**类型不对的只报告不动手**（改类型可能毁数据）、
-多出来的表和字段完全不碰。
+多出来的表和字段完全不碰。唯一会「改」的是我们自己维护的公式列：公式变了就换成新的
+（值是算出来的，换了不丢数据），例如 2026-09-26「本笔佣金」加上了 AI 规则。
 
 逻辑住在 ``crm_basebot.structure``（那边也负责说清「为什么」）。这个文件只剩
 「解析命令行 + 打印 + 建完做一次公式自检」——同样的结构逻辑迁移时也要用，所以它必须
@@ -30,6 +31,8 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from crm_basebot.domain import schema  # noqa: E402
+from crm_basebot.domain.ai_status import eligibility_of  # noqa: E402
+from crm_basebot.domain.commission import trade_counts  # noqa: E402
 from crm_basebot.domain.dates import ms_to_date  # noqa: E402
 from crm_basebot.lark.bitable import BitableClient  # noqa: E402
 from crm_basebot.lark.client import get_client  # noqa: E402
@@ -43,7 +46,14 @@ from crm_basebot.structure import (  # noqa: E402
 )
 from crm_basebot.structure import build_field as _build_field  # noqa: E402
 
-__all__ = ["LINK_TARGETS", "TARGET_TABLES", "_build_field", "_verify_formulas", "main"]
+__all__ = [
+    "LINK_TARGETS",
+    "TARGET_TABLES",
+    "_build_field",
+    "_verify_ai_commission",
+    "_verify_formulas",
+    "main",
+]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -87,6 +97,12 @@ def main(argv: list[str] | None = None) -> int:
         _verify_formulas(
             BitableClient(settings.base_app_token),
             result.table_ids.get(schema.TABLE_DAILY_BOARD_NAME),
+            tz=ZoneInfo(settings.business_timezone),
+        )
+        _verify_ai_commission(
+            BitableClient(settings.base_app_token),
+            result.table_ids.get(schema.TABLE_DAILY_BOARD_NAME),
+            result.table_ids.get(schema.TABLE_CLIENT_NAME),
             tz=ZoneInfo(settings.business_timezone),
         )
 
@@ -173,6 +189,77 @@ def _verify_formulas(
         )
     else:
         print(f"  「{schema.BOARD_MONTH}」抽查 {month_checked} 行，和业务时区一致。")
+
+
+def _verify_ai_commission(
+    bitable: BitableClient,
+    board_id: str | None,
+    client_id: str | None,
+    *,
+    tz: tzinfo,
+    show: int = 3,
+) -> bool:
+    """拿 Python 的算法（月结用的那套）逐行核对 Base 里的「AI佣金起算」「本笔佣金」。
+
+    那两条公式是 domain/ai_status.py 的翻版，平台又不校验公式 —— 写错了只会静默出错数。
+    所以每一行挂上渠道的交易都用 Python 再算一遍比对。全表扫，不抽样：AI 规则只影响
+    9 月以后的行，抽前几百行可能一行都碰不到。返回是否全对。
+    """
+    if not board_id or not client_id:
+        return True
+
+    eligibility = {
+        record.record_id: eligibility_of(record.fields, tz=tz)
+        for record in bitable.iter_records(client_id)
+    }
+    columns = [
+        schema.BOARD_ORDER_DATE,
+        schema.BOARD_CLIENT_LINK,
+        schema.BOARD_TOTAL_REVENUE,
+        schema.BOARD_CLIENT_RATE,
+        schema.BOARD_AI_GATE,
+        schema.BOARD_ROW_COMMISSION,
+    ]
+    checked = bad = 0
+    samples: list[str] = []
+    for record in bitable.iter_records(board_id, field_names=columns):
+        fields = record.fields
+        linked = link_ids(fields.get(schema.BOARD_CLIENT_LINK))
+        rate = to_number(fields.get(schema.BOARD_CLIENT_RATE))
+        if not linked or rate is None or linked[0] not in eligibility:
+            continue
+        checked += 1
+        ai = eligibility[linked[0]]
+        revenue = to_number(fields.get(schema.BOARD_TOTAL_REVENUE)) or 0.0
+        order_time = fields.get(schema.BOARD_ORDER_DATE)
+        expected = revenue * rate / 100 if trade_counts(ai, order_time, tz=tz) else 0.0
+        got = to_number(fields.get(schema.BOARD_ROW_COMMISSION))
+        gate = to_number(fields.get(schema.BOARD_AI_GATE))
+        if got is None or abs(got - expected) > 0.01 or gate != ai.gate_number():
+            bad += 1
+            if len(samples) < show:
+                day = ms_to_date(order_time, tz=tz) if isinstance(order_time, int | float) else ""
+                samples.append(
+                    f"{day} 本笔佣金 {got}（应为 {expected:.2f}），"
+                    f"AI佣金起算 {gate}（应为 {ai.gate_number()}）"
+                )
+
+    print(f"\nAI 规则自检（「{schema.BOARD_ROW_COMMISSION}」逐行和月结的算法对）：")
+    if not checked:
+        print("  还没有挂上渠道的交易，没得核对。")
+        return True
+    if bad:
+        print(f"  ! 核对 {checked} 行，{bad} 行对不上。例如：")
+        for line in samples:
+            print(f"    {line}")
+        print(
+            "  刚改完公式时 Base 可能还在算：等一两分钟再跑一次 sync_base.py --apply"
+            "（结构已经对齐，不会再改东西，只会再核对一次）。还不对就把这段截图发给开发。"
+        )
+        print("  钱不受影响：月结和机器人不读这一列。")
+        return False
+    print(f"  核对 {checked} 行，全对。")
+    return True
 
 
 if __name__ == "__main__":

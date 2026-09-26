@@ -84,6 +84,11 @@ def print_plan(plan: DailyPlan, *, from_mail: bool = False) -> None:
 
 
 def print_result(result: DailyResult) -> None:
+    if result.relinked:
+        print(
+            f"补挂客户关联：{result.relinked} 行以前的交易，客户后来才登记，"
+            "这次把渠道、比例、本笔佣金补上了。"
+        )
     if not result.plan.has_work:
         return
     print(f"删除 {result.deleted} 条，写入 {result.written} 条。")

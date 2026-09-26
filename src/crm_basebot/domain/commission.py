@@ -33,7 +33,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, tzinfo
+from datetime import date, datetime, tzinfo
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -128,40 +128,60 @@ class Referral:
     status: str
 
 
-def period_of(order_time: Any, *, tz: tzinfo) -> str:
-    """把订单时间归到 YYYY-MM。
+def day_of(order_time: Any, *, tz: tzinfo) -> date | None:
+    """把订单时间归到业务时区 ``tz`` 的那一天。解析不出来返回 None。
 
-    Bitable 日期字段是 UTC 毫秒时间戳，归月必须先换算到业务时区 ``tz``：Base 里
-    显示「3 月 1 日 00:30」的交易，UTC 还是 2 月 28 日，按 UTC 取月份会把每个月
-    1 号凌晨的交易全算进上个月。``tz`` 刻意没有默认值 —— 悄悄退回 UTC 就是这个
-    bug 本身。
-
-    导入的数据偶尔是 '2026/03/02' 这类字符串，没有时区可言，照字面归月。
+    Bitable 日期字段是 UTC 毫秒时间戳，必须先换算到业务时区：Base 里显示「3 月 1 日
+    00:30」的交易，UTC 还是 2 月 28 日。``tz`` 刻意没有默认值 —— 悄悄退回 UTC 就是这个
+    bug 本身。导入的数据偶尔是 '2026/03/02' 这类字符串，没有时区可言，照字面取。
     """
     if order_time is None or order_time == "":
-        return ""
+        return None
 
     if isinstance(order_time, int | float) and not isinstance(order_time, bool):
-        moment = datetime.fromtimestamp(float(order_time) / 1000, tz=tz)
-        return moment.strftime("%Y-%m")
+        return datetime.fromtimestamp(float(order_time) / 1000, tz=tz).date()
 
     text = extract_text(order_time)
     if not text:
-        return ""
+        return None
 
     for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M:%S"):
         try:
-            return datetime.strptime(text[: len(fmt) + 2].strip(), fmt).strftime("%Y-%m")
+            return datetime.strptime(text[: len(fmt) + 2].strip(), fmt).date()
         except ValueError:
             continue
+    return None
 
+
+def period_of(order_time: Any, *, tz: tzinfo) -> str:
+    """把订单时间归到 YYYY-MM（业务时区，理由见 ``day_of``）。"""
+    day = day_of(order_time, tz=tz)
+    if day is not None:
+        return day.strftime("%Y-%m")
+
+    text = extract_text(order_time) if order_time not in (None, "") else ""
     # 退一步：形如 2026/03 或 2026-03 开头的也认
     normalized = text.replace("/", "-")
     if len(normalized) >= 7 and normalized[4] == "-":
         return normalized[:7]
 
-    logger.warning("无法解析订单时间 %r，该行不计入任何月份", order_time)
+    if text:
+        logger.warning("无法解析订单时间 %r，该行不计入任何月份", order_time)
     return ""
+
+
+def trade_counts(eligibility: AiEligibility | None, order_time: Any, *, tz: tzinfo) -> bool:
+    """这一笔交易按 AI 规则算不算佣金（规则见 domain/ai_status.py）。
+
+    月结、佣金查询、渠道详情卡都走这里。客户不在 AI 资格表里（没登记）的不归这里管，
+    照算；日期只精确到月的老字符串数据（2026-09 以前才有）也照算。
+    """
+    if eligibility is None:
+        return True
+    day = day_of(order_time, tz=tz)
+    if day is None:
+        return True
+    return eligibility.counts(day)
 
 
 class CommissionCalculator:
@@ -179,7 +199,7 @@ class CommissionCalculator:
         self._latest_period = ""
         # 客户UID -> AI 资格（domain/ai_status.py）。load_client_map 顺手读出来。
         self._eligibility: dict[str, AiEligibility] = {}
-        # 因为「还不是 AI」没算进去的客户：(月份, UID)。只用来在报告里说一句，不影响金额。
+        # 有交易因为「当时还不是 AI」没算进去的客户：(月份, UID)。只用来在报告里说一句。
         self.excluded_not_ai: set[tuple[str, str]] = set()
 
     # ---------- 载入维表 ----------
@@ -267,7 +287,8 @@ class CommissionCalculator:
                 unmapped.add(uid)
                 continue
 
-            if not self._eligibility.get(uid, AiEligibility()).counts(row_period):
+            order_time = record.fields.get(schema.BOARD_ORDER_DATE)
+            if not trade_counts(self._eligibility.get(uid), order_time, tz=self._tz):
                 self.excluded_not_ai.add((row_period, uid))
                 continue
 

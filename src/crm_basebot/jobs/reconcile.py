@@ -255,9 +255,12 @@ def run(args: argparse.Namespace, settings, bitable: BitableClient) -> int:
         (p, uid) for p, uid in calculator.excluded_not_ai if args.all_periods or p == period
     )
     if excluded:
-        # 不是漏算：客户登记了，但那个月还不是 AI（domain/ai_status.py）。说一句，
+        # 不是漏算：客户登记了，但交易那天还不是 AI（domain/ai_status.py）。说一句，
         # 免得有人拿看板对账时以为这几笔掉了。
-        print(f"\n另有 {len(excluded)} 个「客户 × 月份」因为那个月还不是 AI，交易没算佣金：")
+        print(
+            f"\n另有 {len(excluded)} 个「客户 × 月份」里有交易因为当天还不是 AI，没算佣金"
+            "（升级第二天起才算）："
+        )
         for p, uid in excluded[:20]:
             print(f"    {p}  {uid}")
         if len(excluded) > 20:

@@ -20,6 +20,7 @@ import pytest
 from lark_oapi.api.bitable.v1 import (
     BatchCreateAppTableRecordResponse,
     BatchDeleteAppTableRecordResponse,
+    BatchUpdateAppTableRecordResponse,
     CreateAppTableRecordResponse,
     DeleteAppTableRecordResponse,
     GetAppTableRecordResponse,
@@ -56,6 +57,7 @@ class FakeEndpoint:
     delete = _next
     batch_create = _next
     batch_delete = _next
+    batch_update = _next
 
 
 class FakeSdkClient:
@@ -384,3 +386,29 @@ def test_批量写空列表不发请求():
 def test_批大小超过上限在本地就被拦下():
     with pytest.raises(ValueError, match="500"):
         client().batch_create_records(TABLE_ID, [{}], batch_size=501)
+
+
+def _batch_updated(count: int):
+    records = [{"record_id": f"rec{i}", "fields": {}} for i in range(count)]
+    return BatchUpdateAppTableRecordResponse({"code": 0, "data": {"records": records}})
+
+
+def test_批量更新按500条一批并带上record_id():
+    updates = {f"rec{i}": {"客户": [f"recC{i}"]} for i in range(501)}
+    endpoint = FakeEndpoint([_batch_updated(500), _batch_updated(1)])
+
+    updated = client(app_table_record=endpoint).batch_update_records(TABLE_ID, updates)
+
+    assert updated == 501
+    first = endpoint.requests[0].request_body.records
+    assert [len(r.request_body.records) for r in endpoint.requests] == [500, 1]
+    assert (first[0].record_id, first[0].fields) == ("rec0", {"客户": ["recC0"]})
+
+
+def test_批量更新回来的条数对不上时报错():
+    endpoint = FakeEndpoint([_batch_updated(1)])
+
+    with pytest.raises(BitableError, match="2"):
+        client(app_table_record=endpoint).batch_update_records(
+            TABLE_ID, {"rec1": {"n": 1}, "rec2": {"n": 2}}
+        )

@@ -27,7 +27,7 @@ from crm_basebot.lark.bitable import (
     FIELD_TYPE_USER,
 )
 
-from .conftest import TBL_BOARD
+from .conftest import TBL_BOARD, TBL_CLIENT
 
 SGT = ZoneInfo("Asia/Singapore")
 
@@ -241,11 +241,164 @@ def test_反查公式里的字段名和_schema_一致():
     assert rate.endswith(f".[{schema.REFERRAL_RATE}]")
 
 
-def test_本笔佣金那一列不再建():
-    """2026-09-25 删了：AI 规则上线后它会和月结对不上，而月结从来不读它。
-    sync 的清单里要是还有它，人在 Base 里删掉，下次 sync 又会建回来。"""
-    assert "本笔佣金" not in schema.DAILY_BOARD_DERIVED_FIELDS
-    assert "本笔佣金" not in schema.DAILY_BOARD_DERIVED_FORMULAS
+def test_本笔佣金按AI规则算():
+    """2026-09-26：超哥每天看这一列，所以留着，但要和月结同一条 AI 规则。"""
+    expression, data_type = schema.DAILY_BOARD_DERIVED_FORMULAS[schema.BOARD_ROW_COMMISSION]
+    assert data_type == schema.FORMULA_DATA_TYPE_NUMBER
+    assert expression.startswith(f'IF(ISBLANK([{schema.BOARD_CLIENT_RATE}]), ""')  # 没渠道是空
+    assert f"< {schema.AI_RULE_START_NUMBER}" in expression  # 9 月以前照旧
+    assert f"> [{schema.BOARD_AI_GATE}]" in expression  # 晚于门槛才算（第二天起）
+    assert f"[{schema.BOARD_TOTAL_REVENUE}] * [{schema.BOARD_CLIENT_RATE}] / 100, 0))" in expression
+
+
+def test_门槛列从客户表拿():
+    expression, _ = schema.DAILY_BOARD_DERIVED_FORMULAS[schema.BOARD_AI_GATE]
+    assert expression == f"[{schema.BOARD_CLIENT_LINK}].[{schema.CLIENT_AI_GATE}]"
+    assert list(schema.DAILY_BOARD_DERIVED_FIELDS)[-2:] == [
+        schema.BOARD_AI_GATE,
+        schema.BOARD_ROW_COMMISSION,
+    ]  # 本笔佣金引用门槛列，门槛列要先建
+
+
+def test_客户表的门槛公式用的是那三个选项和两个特殊数():
+    expression, data_type = schema.CLIENT_DERIVED_FORMULAS[schema.CLIENT_AI_GATE]
+    assert data_type == schema.FORMULA_DATA_TYPE_NUMBER
+    for option in schema.AI_STATUS_OPTIONS:
+        assert f'"{option}"' in expression
+    assert f"[{schema.CLIENT_AI_STATUS}]" in expression
+    assert f"ISBLANK([{schema.CLIENT_AI_DATE}])" in expression
+    assert str(schema.AI_GATE_NEVER) in expression
+
+
+def test_客户表的公式列建在AI两列后面():
+    fields = list(sync_base.TARGET_TABLES[schema.TABLE_CLIENT_NAME])
+    assert fields.index(schema.CLIENT_AI_GATE) > fields.index(schema.CLIENT_AI_DATE)
+
+
+# ---------- 公式变了要跟上 ----------
+
+
+class _Response:
+    def __init__(self) -> None:
+        self.code, self.msg, self.data = 0, "ok", None
+
+    def success(self) -> bool:
+        return True
+
+
+class _FieldEndpoint:
+    def __init__(self) -> None:
+        self.created: list[str] = []
+        self.updated: list[tuple[str, str]] = []
+
+    def create(self, request):
+        self.created.append(request.request_body.field_name)
+        return _Response()
+
+    def update(self, request):
+        body = request.request_body
+        self.updated.append((request.field_id, body.property.formula_expression))
+        return _Response()
+
+
+class _Sdk:
+    def __init__(self) -> None:
+        self.bitable = self
+        self.v1 = self
+        self.app_table_field = _FieldEndpoint()
+
+
+class _Base:
+    """只有 list_tables / list_fields：ensure_structure 只读这两个。"""
+
+    def __init__(self, fields_by_table: dict[str, list]) -> None:
+        self._fields = fields_by_table
+
+    def list_tables(self):
+        from crm_basebot.lark.bitable import TableInfo
+
+        return [TableInfo(table_id=f"tbl_{name}", name=name) for name in sync_base.TARGET_TABLES]
+
+    def list_fields(self, table_id: str):
+        return self._fields.get(table_id.removeprefix("tbl_"), [])
+
+
+def _complete_fields(overrides: dict[tuple[str, str], str]) -> dict[str, list]:
+    """每张表的字段都齐了；公式列默认是现行公式，``overrides`` 里的换成旧公式。"""
+    from crm_basebot.lark.bitable import FieldInfo
+    from crm_basebot.structure import FORMULAS
+
+    out: dict[str, list] = {}
+    for table, fields in sync_base.TARGET_TABLES.items():
+        out[table] = []
+        for index, (name, type_code) in enumerate(fields.items()):
+            props = {}
+            if (table, name) in FORMULAS:
+                wanted = FORMULAS[(table, name)][0]
+                props = {"formula_expression": overrides.get((table, name), wanted)}
+            out[table].append(
+                FieldInfo(
+                    field_id=f"fld{index}",
+                    name=name,
+                    type=type_code,
+                    ui_type="",
+                    is_primary=index == 0,
+                    props=props,
+                )
+            )
+    return out
+
+
+def _ensure(fields, *, apply: bool):
+    from types import SimpleNamespace
+
+    from crm_basebot.structure import ensure_structure
+
+    sdk = _Sdk()
+    result = ensure_structure(
+        settings=SimpleNamespace(base_app_token="bascn"),
+        bitable=_Base(fields),
+        client=sdk,
+        apply=apply,
+    )
+    return result, sdk.app_table_field
+
+
+def test_老的本笔佣金公式会换成带AI规则的():
+    old = 'IF(ISBLANK([分佣比例]), "", [总收入(opt+现货+合约)] * [分佣比例] / 100)'
+    key = (schema.TABLE_DAILY_BOARD_NAME, schema.BOARD_ROW_COMMISSION)
+    result, endpoint = _ensure(_complete_fields({key: old}), apply=True)
+
+    assert result.plan == [f"「{schema.TABLE_DAILY_BOARD_NAME}」改公式 本笔佣金"]
+    assert len(endpoint.updated) == 1
+    assert endpoint.updated[0][1] == schema.DAILY_BOARD_DERIVED_FORMULAS["本笔佣金"][0]
+    assert endpoint.created == []
+
+
+def test_预演时公式只说不改():
+    key = (schema.TABLE_DAILY_BOARD_NAME, schema.BOARD_ROW_COMMISSION)
+    result, endpoint = _ensure(_complete_fields({key: "1"}), apply=False)
+    assert result.plan and endpoint.updated == []
+
+
+def test_公式一样时什么都不做_空格不算差别():
+    key = (schema.TABLE_CLIENT_NAME, schema.CLIENT_AI_GATE)
+    spaced = "  ".join(schema.CLIENT_DERIVED_FORMULAS[schema.CLIENT_AI_GATE][0].split(" "))
+    result, endpoint = _ensure(_complete_fields({key: spaced}), apply=True)
+    assert result.plan == [] and endpoint.updated == []
+
+
+def test_缺了门槛列和本笔佣金就加上():
+    fields = _complete_fields({})
+    fields[schema.TABLE_DAILY_BOARD_NAME] = [
+        f for f in fields[schema.TABLE_DAILY_BOARD_NAME] if f.name != schema.BOARD_ROW_COMMISSION
+    ]
+    fields[schema.TABLE_CLIENT_NAME] = [
+        f for f in fields[schema.TABLE_CLIENT_NAME] if f.name != schema.CLIENT_AI_GATE
+    ]
+    result, endpoint = _ensure(fields, apply=True)
+    assert endpoint.created == [schema.CLIENT_AI_GATE, schema.BOARD_ROW_COMMISSION]
+    assert result.added_fields == 2
 
 
 def test_AI状态单选列建的时候带着三个选项():
@@ -304,3 +457,41 @@ def test_月份自检通过时不报警(fake_bitable, capsys):
     sync_base._verify_formulas(fake_bitable, TBL_BOARD, tz=SGT, sample=10)
 
     assert "和业务时区一致" in capsys.readouterr().out
+
+
+# ---------- AI 规则自检 ----------
+
+
+def _ai_board(fake_bitable, *, commission_on_sep_10: float):
+    """一个 9/10 升级的客户，9/10 和 9/11 各一笔 1000 的交易，比例 20%。"""
+    client = fake_bitable.tables[TBL_CLIENT].add_existing(
+        {
+            schema.CLIENT_AI_STATUS: schema.AI_STATUS_UPGRADED,
+            schema.CLIENT_AI_DATE: date_to_ms(date(2026, 9, 10), tz=SGT),
+        }
+    )
+    for day, commission in ((10, commission_on_sep_10), (11, 200.0)):
+        fake_bitable.tables[TBL_BOARD].add_existing(
+            {
+                schema.BOARD_ORDER_DATE: date_to_ms(date(2026, 9, day), tz=SGT),
+                schema.BOARD_CLIENT_LINK: {"link_record_ids": [client]},
+                schema.BOARD_TOTAL_REVENUE: 1000.0,
+                schema.BOARD_CLIENT_RATE: 20,
+                schema.BOARD_AI_GATE: 20260910,
+                schema.BOARD_ROW_COMMISSION: commission,
+            }
+        )
+
+
+def test_AI自检_Base和月结算的一样就说全对(fake_bitable, capsys):
+    _ai_board(fake_bitable, commission_on_sep_10=0.0)
+    assert sync_base._verify_ai_commission(fake_bitable, TBL_BOARD, TBL_CLIENT, tz=SGT)
+    assert "核对 2 行，全对" in capsys.readouterr().out
+
+
+def test_AI自检_升级当天Base还算了钱就报出来(fake_bitable, capsys):
+    _ai_board(fake_bitable, commission_on_sep_10=200.0)
+    assert not sync_base._verify_ai_commission(fake_bitable, TBL_BOARD, TBL_CLIENT, tz=SGT)
+    out = capsys.readouterr().out
+    assert "1 行对不上" in out
+    assert "2026-09-10 本笔佣金 200.0（应为 0.00）" in out

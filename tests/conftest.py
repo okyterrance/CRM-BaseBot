@@ -128,6 +128,13 @@ class FakeBitable:
                 self.delete_record(table_id, record_id)
         return len(record_ids)
 
+    def batch_update_records(
+        self, table_id: str, updates: dict[str, dict[str, Any]], *, batch_size: int = 500
+    ) -> int:
+        for record_id, fields in updates.items():
+            self.update_record(table_id, record_id, fields)
+        return len(updates)
+
     def get_record(self, table_id: str, record_id: str) -> Record:
         return Record(record_id=record_id, fields=dict(self.table(table_id).records[record_id]))
 
